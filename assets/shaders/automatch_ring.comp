@@ -1,0 +1,406 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+// NOTE (Stage2):
+// uColorA/uColorB are STATS downsampled (statsW x statsH)
+// uDepthA/uDepthB are FULL-RES depth (fullW x fullH)
+layout(set=0, binding=0) uniform sampler2D uColorA;  // statsA
+layout(set=0, binding=1) uniform sampler2D uDepthA;  // full depthA
+layout(set=0, binding=2) uniform sampler2D uColorB;  // statsB
+layout(set=0, binding=3) uniform sampler2D uDepthB;  // full depthB
+
+layout(std430, set=0, binding=4) buffer AutoMatchBuf
+{
+    vec4 params;     // (gain, wbR, wbG, wbB)
+    vec4 blurStats;  // (blurSigma, blurRatio, EA_mean, EB_mean)
+} gOut;
+
+layout(set=0, binding=5) uniform sampler2D uPrevLut;
+layout(set=0, binding=6, rgba16f) uniform writeonly image2D uNextLutOut;
+
+// ============================
+// Stage2 Push Constant (PC2)
+// ============================
+layout(push_constant) uniform PC
+{
+    int   statsW;
+    int   statsH;
+    int   fullW;
+    int   fullH;
+
+    int   ringRadius;    // in stats pixels
+    int   ringSamples;
+    int   stride;        // in stats pixels
+    int   styleLock;
+
+    float coverageTh;
+    float emaAlpha;
+    float maxDeltaGain;
+    float maxDeltaWb;
+
+    float minGain;
+    float maxGain;
+    float reserved0;
+    float reserved1;
+} pc;
+
+const int LUT_N  = 256;
+const int HIST_N = 64;
+const float FAR_DEPTH = 1.0;
+
+float saturate(float x) { return clamp(x, 0.0, 1.0); }
+float luma(vec3 c){ return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+bool hasA(float dA){ return abs(dA - FAR_DEPTH) > 1e-5; }
+
+vec3 safeUnpremul(vec4 premul)
+{
+    float a = clamp(premul.a, 0.0, 1.0);
+    if (a < 1e-6) return vec3(0.0);
+    return premul.rgb / a;
+}
+
+vec3 fetchPrevLut(int i)
+{
+    i = clamp(i, 0, 255);
+    return texelFetch(uPrevLut, ivec2(i, 0), 0).rgb;
+}
+
+// ============================================================
+// Visible coverage for premult B
+// ============================================================
+float visFromPremul(vec4 b)
+{
+    float a = clamp(b.a, 0.0, 1.0);
+    float Lp = luma(clamp(b.rgb, vec3(0.0), vec3(1.0)));
+    float v = smoothstep(0.002, 0.020, Lp);
+    v *= smoothstep(0.02, 0.10, a);
+    return clamp(v, 0.0, 1.0);
+}
+
+float covVisible(vec4 b)
+{
+    float a = clamp(b.a, 0.0, 1.0);
+    return a * visFromPremul(b);
+}
+
+// ============================================================
+// Stats coord -> Full coord mapping (center-aligned)
+// ============================================================
+ivec2 statsToFull(ivec2 pS)
+{
+    float fx = (float(pS.x) + 0.5) * float(pc.fullW) / max(1.0, float(pc.statsW));
+    float fy = (float(pS.y) + 0.5) * float(pc.fullH) / max(1.0, float(pc.statsH));
+    ivec2 pF = ivec2(int(floor(fx)), int(floor(fy)));
+    pF = clamp(pF, ivec2(0), ivec2(max(pc.fullW,1) - 1, max(pc.fullH,1) - 1));
+    return pF;
+}
+
+// ============================================================
+// Histogram CDF (1D luma matching)
+// ============================================================
+shared uint  histA[HIST_N];
+shared uint  histB[HIST_N];
+shared float cdfA[HIST_N];
+shared float cdfB[HIST_N];
+
+void clearHist()
+{
+    for (int i=0; i<HIST_N; ++i) {
+        histA[i]=0u; histB[i]=0u;
+        cdfA[i]=0.0; cdfB[i]=0.0;
+    }
+}
+
+int binOf(float x)
+{
+    x = saturate(x);
+    return int(floor(x * float(HIST_N - 1) + 0.5));
+}
+
+void addHist1D(float a, float b)
+{
+    int ia = binOf(a);
+    int ib = binOf(b);
+    histA[ia]++; histB[ib]++;
+}
+
+void buildCDF1D()
+{
+    uint sumA=0u, sumB=0u;
+    for (int i=0;i<HIST_N;++i){ sumA += histA[i]; sumB += histB[i]; }
+    float invA = (sumA>0u) ? (1.0/float(sumA)) : 0.0;
+    float invB = (sumB>0u) ? (1.0/float(sumB)) : 0.0;
+
+    uint accA=0u, accB=0u;
+    for (int i=0;i<HIST_N;++i){
+        accA += histA[i]; cdfA[i] = float(accA)*invA;
+        accB += histB[i]; cdfB[i] = float(accB)*invB;
+    }
+}
+
+float cdfAt(float x)
+{
+    x = saturate(x);
+    float fx = x * float(HIST_N - 1);
+    int i0 = int(floor(fx));
+    int i1 = min(i0 + 1, HIST_N - 1);
+    float t = fx - float(i0);
+    return mix(cdfA[i0], cdfA[i1], t);
+}
+
+float invCDF(float t)
+{
+    t = saturate(t);
+    int j = 0;
+    for (; j < HIST_N; ++j) if (cdfB[j] >= t) break;
+    if (j <= 0) return 0.0;
+    if (j >= HIST_N) return 1.0;
+
+    float c0 = cdfB[j-1];
+    float c1 = cdfB[j];
+    float f = (c1 > c0) ? (t - c0) / (c1 - c0) : 0.0;
+    float x0 = float(j-1) / float(HIST_N - 1);
+    float x1 = float(j)   / float(HIST_N - 1);
+    return mix(x0, x1, f);
+}
+
+vec3 chroma(vec3 c)
+{
+    float L = max(luma(c), 1e-5);
+    return c / L;
+}
+
+// ============================================================
+// Lap energy in STATS domain (stable, clamped edges)
+// ============================================================
+ivec2 clampStats(ivec2 p)
+{
+    return clamp(p, ivec2(0), ivec2(max(pc.statsW,1) - 1, max(pc.statsH,1) - 1));
+}
+
+float lapEnergyA_stats(ivec2 pS)
+{
+    ivec2 p  = clampStats(pS);
+    ivec2 px1 = clampStats(pS + ivec2( 1,0));
+    ivec2 px0 = clampStats(pS + ivec2(-1,0));
+    ivec2 py1 = clampStats(pS + ivec2(0, 1));
+    ivec2 py0 = clampStats(pS + ivec2(0,-1));
+
+    vec3 c  = texelFetch(uColorA, p, 0).rgb;
+    vec3 cx = texelFetch(uColorA, px1, 0).rgb + texelFetch(uColorA, px0, 0).rgb;
+    vec3 cy = texelFetch(uColorA, py1, 0).rgb + texelFetch(uColorA, py0, 0).rgb;
+    vec3 lap = (cx + cy) - 4.0 * c;
+    return luma(abs(lap));
+}
+
+float lapEnergyB_stats(ivec2 pS)
+{
+    ivec2 p  = clampStats(pS);
+    ivec2 px1 = clampStats(pS + ivec2( 1,0));
+    ivec2 px0 = clampStats(pS + ivec2(-1,0));
+    ivec2 py1 = clampStats(pS + ivec2(0, 1));
+    ivec2 py0 = clampStats(pS + ivec2(0,-1));
+
+    vec4 bp = texelFetch(uColorB, p, 0);
+
+    // ignore "visually invisible" contributions
+    float covV = covVisible(bp);
+    if (covV < 0.10) return 0.0;
+
+    float a = clamp(bp.a, 0.0, 1.0);
+    if (a < 1e-4) return 0.0;
+
+    vec3 c  = safeUnpremul(bp);
+    vec3 cx = safeUnpremul(texelFetch(uColorB, px1, 0)) + safeUnpremul(texelFetch(uColorB, px0, 0));
+    vec3 cy = safeUnpremul(texelFetch(uColorB, py1, 0)) + safeUnpremul(texelFetch(uColorB, py0, 0));
+    vec3 lap = (cx + cy) - 4.0 * c;
+    return luma(abs(lap));
+}
+
+float ratioToSigma(float r)
+{
+    r = max(r, 0.0);
+    float t = max(log2(max(r, 1.0)), 0.0);
+    float sigma = 1.20 * t;
+    sigma = clamp(sigma, 0.0, 3.0);
+    return sigma;
+}
+
+// ============================================================
+// Freeze path: copy prev LUT and keep params stable
+// ============================================================
+void forwardPrevAndFreezeParams()
+{
+    vec4 prevP = gOut.params;
+    if (prevP.x <= 0.0) prevP.x = 1.0;
+    if (all(equal(prevP.yzw, vec3(0.0)))) prevP.yzw = vec3(1.0);
+    gOut.params = prevP;
+
+    vec4 bs = gOut.blurStats;
+    if (!(bs.x >= 0.0)) bs.x = 0.0;
+    bs.x = clamp(bs.x, 0.0, 3.0);
+    gOut.blurStats = bs;
+
+    for (int i = 0; i < LUT_N; ++i) {
+        vec3 prevL = fetchPrevLut(i);
+        imageStore(uNextLutOut, ivec2(i, 0), vec4(prevL, 1.0));
+    }
+}
+
+void main()
+{
+    // Stage2 still supports lock
+    if (pc.styleLock != 0)
+    {
+        forwardPrevAndFreezeParams();
+        return;
+    }
+
+    // sanity
+    if (pc.statsW <= 8 || pc.statsH <= 8 || pc.fullW <= 8 || pc.fullH <= 8)
+    {
+        forwardPrevAndFreezeParams();
+        return;
+    }
+
+    clearHist();
+
+    vec4 prevP = gOut.params;
+    float gainPrev = (prevP.x > 0.0) ? prevP.x : 1.0;
+    vec3  wbPrev   = (all(equal(prevP.yzw, vec3(0.0)))) ? vec3(1.0) : prevP.yzw;
+
+    float sigmaPrev = gOut.blurStats.x;
+    if (!(sigmaPrev >= 0.0)) sigmaPrev = 0.0;
+
+    // stride/radius in stats domain
+    int step   = max(pc.stride, 1);
+    int margin = clamp(pc.ringRadius, 0, 64);
+
+    // map margin to stay inside stats image
+    margin = min(margin, min(pc.statsW/4, pc.statsH/4));
+
+    // depth gate params (full-res depth tolerance)
+    float depthTolBase = 1.5e-3;
+    float depthTolK    = 1.2e-2;
+
+    vec3 sumA_chr = vec3(0.0);
+    vec3 sumB_chr = vec3(0.0);
+    int  cnt = 0;
+
+    float sumEA = 0.0;
+    float sumEB = 0.0;
+    int   cntE  = 0;
+
+    int jx = (pc.statsW / max(step,1)) & 1;
+    int jy = (pc.statsH / max(step,1)) & 1;
+
+    for (int y = margin + jy; y < pc.statsH - margin; y += step)
+    for (int x = margin + jx; x < pc.statsW  - margin; x += step)
+    {
+        ivec2 pS = ivec2(x, y);            // stats coord
+        ivec2 pF = statsToFull(pS);        // full coord for depth
+
+        float dA = texelFetch(uDepthA, pF, 0).r;
+        if (!hasA(dA)) continue;
+
+        vec4 bP = texelFetch(uColorB, pS, 0);
+
+        // covVisible gate in stats domain
+        float covV = covVisible(bP);
+        if (covV < pc.coverageTh) continue;
+
+        // extra premult-luma gate: avoid "invisible but alpha big"
+        float Lp = luma(clamp(bP.rgb, vec3(0.0), vec3(1.0)));
+        if (Lp < 0.003) continue;
+
+        float dB = texelFetch(uDepthB, pF, 0).r;
+
+        float depthTol = depthTolBase + depthTolK * dA;
+        if (abs(dA - dB) > depthTol) continue;
+
+        vec3 A = texelFetch(uColorA, pS, 0).rgb;
+        vec3 B = safeUnpremul(bP);
+
+        float LA = luma(A);
+        float LB = luma(B);
+
+        if (LA < 0.04 || LA > 0.96) continue;
+        if (LB < 0.04 || LB > 0.96) continue;
+
+        sumA_chr += chroma(A);
+        sumB_chr += chroma(B);
+        cnt++;
+
+        addHist1D(LA, LB);
+
+        // energy sampling also in stats domain
+        if (x > 1 && y > 1 && x < pc.statsW - 2 && y < pc.statsH - 2)
+        {
+            float eA = lapEnergyA_stats(pS);
+            float eB = lapEnergyB_stats(pS);
+
+            sumEA += eA;
+            sumEB += eB;
+            cntE++;
+        }
+    }
+
+    float aEma = clamp(pc.emaAlpha, 0.0, 1.0);
+
+    // Because stats is low-res, reduce required samples slightly
+    // (still keep reasonable stability)
+    if (cnt < 64 || cntE < 64)
+    {
+        forwardPrevAndFreezeParams();
+        return;
+    }
+
+    // gain: keep near 1 (avoid brightness drift)
+    float gain = mix(gainPrev, 1.0, 0.25);
+    gain = clamp(gain, 0.99, 1.01);
+
+    // WB chroma-only slow learn
+    vec3 meanA = sumA_chr / float(max(cnt,1));
+    vec3 meanB = sumB_chr / float(max(cnt,1));
+    vec3 targetWb = meanB / max(meanA, vec3(1e-5));
+    targetWb = clamp(targetWb, vec3(0.94), vec3(1.06));
+
+    vec3 wb = wbPrev;
+    float dwMax = pc.maxDeltaWb * 0.20;
+    wb += clamp(targetWb - wb, vec3(-dwMax), vec3(dwMax));
+    wb = mix(wb, targetWb, min(aEma, 0.015));
+
+    gOut.params = vec4(gain, wb);
+
+    // blur sigma from lap energy ratio
+    float EA = sumEA / float(max(cntE,1));
+    float EB = sumEB / float(max(cntE,1));
+
+    float ratio = EA / max(EB, 1e-6);
+    float sigmaT = ratioToSigma(ratio);
+
+    float sigma = mix(sigmaPrev, sigmaT, min(aEma, 0.05));
+    sigma = clamp(sigma, 0.0, 3.0);
+
+    gOut.blurStats = vec4(sigma, ratio, EA, EB);
+
+    // LUT: 1D luma CDF match
+    buildCDF1D();
+
+    for (int i = 0; i < LUT_N; ++i)
+    {
+        float x = float(i) / float(LUT_N - 1);
+        float y = invCDF(cdfAt(x));
+
+        y = mix(x, y, 0.55);
+        y = saturate(y);
+
+        vec3 curr = vec3(y);
+        vec3 prevL = fetchPrevLut(i);
+
+        vec3 outv = mix(prevL, curr, min(aEma, 0.015));
+        imageStore(uNextLutOut, ivec2(i, 0), vec4(outv, 1.0));
+    }
+}

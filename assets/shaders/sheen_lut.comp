@@ -1,0 +1,118 @@
+#version 450
+
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// 1-channel is enough for sheen DFG scalar
+layout (set = 0, binding = 0, rg16f) writeonly uniform image2D uSheenLut;
+
+const float PI = 3.14159265359;
+
+// same Xi generator as your current LUT shader
+vec2 sampleXi(uint i, uint n)
+{
+    return vec2(
+        float(i) / float(n),
+        fract(sin(float(i) * 12.9898) * 43758.5453)
+    );
+}
+
+// Build tangent basis from N
+void buildTBN(vec3 N, out vec3 T, out vec3 B)
+{
+    vec3 up = (abs(N.z) < 0.999) ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    T = normalize(cross(up, N));
+    B = cross(N, T);
+}
+
+// Charlie half-vector sampling (same as prefilter)
+vec3 importanceSampleCharlie_H(vec2 Xi, float roughness)
+{
+    float alpha = max(roughness * roughness, 1e-4);
+    float m = 2.0 + 1.0 / alpha;
+
+    float phi = 2.0 * PI * Xi.x;
+
+    float sinTheta = pow(Xi.y, 1.0 / m);
+    float cosTheta = sqrt(max(1.0 - sinTheta * sinTheta, 0.0));
+
+    return vec3(
+        cos(phi) * sinTheta,
+        sin(phi) * sinTheta,
+        cosTheta
+    );
+}
+
+// Neubelt visibility for sheen (matches your LightingPass usage idea)
+// V_Neubelt(NoL, NoV) = 1 / (4*(NoL + NoV - NoL*NoV))
+float V_Neubelt(float NoL, float NoV)
+{
+    return 1.0 / max(4.0 * (NoL + NoV - NoL * NoV), 1e-6);
+}
+
+// We compute a scalar sheenDFG(NoV, roughness) so that:
+// sheenIBL ≈ prefilteredSheen(R, roughness) * sheenColor * sheenDFG(NoV, roughness)
+float integrateSheenDFG(float NoV, float roughness)
+{
+    const uint SAMPLE_COUNT = 1024u;
+
+    // shading frame: N = (0,0,1)
+    vec3 N = vec3(0.0, 0.0, 1.0);
+
+    // view vector in this frame
+    vec3 V = vec3(sqrt(max(1.0 - NoV * NoV, 0.0)), 0.0, NoV);
+
+    float sum = 0.0;
+
+    for (uint i = 0u; i < SAMPLE_COUNT; ++i)
+    {
+        vec2 Xi = sampleXi(i, SAMPLE_COUNT);
+
+        // Sample half-vector H from Charlie NDF (in tangent frame where N is +Z)
+        vec3 H = importanceSampleCharlie_H(Xi, roughness);
+
+        // Reflect V about H to get L
+        vec3 L = normalize(2.0 * dot(V, H) * H - V);
+
+        float NoL = max(L.z, 0.0);
+        float NoH = max(H.z, 0.0);
+        float VoH = max(dot(V, H), 0.0);
+
+        if (NoL > 0.0 && NoH > 0.0 && VoH > 0.0)
+        {
+            // Using the same trick as GGX LUT derivation:
+            // When sampling H with pdf_H = D * NoH, converting to L:
+            // pdf_L = (D * NoH) / (4 * VoH).
+            // Our integrand for sheen (no Fresnel term, color handled outside):
+            //   D * V_neubelt(NoL,NoV) * NoL
+            // MC estimator:
+            //   (D * V * NoL) / pdf_L = V * NoL * (4 * VoH / NoH)
+            float Vsh = V_Neubelt(NoL, NoV);
+
+            float contrib = Vsh * NoL * (4.0 * VoH / max(NoH, 1e-6));
+            sum += contrib;
+        }
+    }
+
+    sum /= float(SAMPLE_COUNT);
+    return sum;
+}
+
+void main()
+{
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size  = imageSize(uSheenLut);
+
+    if (coord.x >= size.x || coord.y >= size.y)
+        return;
+
+    float NoV = (coord.x + 0.5) / float(size.x);
+    float roughness = (coord.y + 0.5) / float(size.y);
+
+    // clamp to avoid weird edges
+    NoV = clamp(NoV, 1e-4, 1.0);
+    roughness = clamp(roughness, 0.0, 1.0);
+
+    float sheenDFG = integrateSheenDFG(NoV, roughness);
+
+    imageStore(uSheenLut, coord, vec4(sheenDFG, 0.0, 0.0, 1.0));
+}

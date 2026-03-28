@@ -1,0 +1,97 @@
+#version 450
+
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout (set = 0, binding = 0) uniform samplerCube uEnvMap;
+layout (set = 0, binding = 1, rgba16f) writeonly uniform image2DArray uOutImage;
+
+layout (push_constant) uniform PushConst {
+    uint  outSize;
+    float roughness;
+    uint  mipLevel;
+    uint  mipCount;
+} pc;
+
+// --------------------
+// Utility
+// --------------------
+const float PI = 3.14159265359;
+
+vec3 importanceSampleGGX(vec2 Xi, vec3 N, float roughness)
+{
+    float a = roughness * roughness;
+
+    float phi = 2.0 * PI * Xi.x;
+    float cosTheta = sqrt((1.0 - Xi.y) / (1.0 + (a*a - 1.0) * Xi.y));
+    float sinTheta = sqrt(1.0 - cosTheta*cosTheta);
+
+    vec3 H;
+    H.x = cos(phi) * sinTheta;
+    H.y = sin(phi) * sinTheta;
+    H.z = cosTheta;
+
+    vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent   = normalize(cross(up, N));
+    vec3 bitangent = cross(N, tangent);
+
+    return normalize(tangent * H.x + bitangent * H.y + N * H.z);
+}
+
+vec3 faceDir(uint face, vec2 uv)
+{
+    uv = uv * 2.0 - 1.0;
+
+    if (face == 0) return normalize(vec3( 1.0, -uv.y, -uv.x)); // +X
+    if (face == 1) return normalize(vec3(-1.0, -uv.y,  uv.x)); // -X
+    if (face == 2) return normalize(vec3( uv.x,  1.0,  uv.y)); // +Y
+    if (face == 3) return normalize(vec3( uv.x, -1.0, -uv.y)); // -Y
+    if (face == 4) return normalize(vec3( uv.x, -uv.y,  1.0)); // +Z
+    return            normalize(vec3(-uv.x, -uv.y, -1.0));     // -Z
+}
+
+// --------------------
+// Main
+// --------------------
+void main()
+{
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    uint  face = gl_GlobalInvocationID.z;
+
+    if (gid.x >= pc.outSize || gid.y >= pc.outSize || face >= 6)
+        return;
+
+    vec2 uv = (vec2(gid) + 0.5) / float(pc.outSize);
+    vec3 N  = faceDir(face, uv);
+    vec3 R  = N;
+    vec3 V  = R;
+
+    const uint SAMPLE_COUNT = 1024u;
+    vec3 prefiltered = vec3(0.0);
+    float totalWeight = 0.0;
+
+    for (uint i = 0u; i < SAMPLE_COUNT; ++i)
+    {
+        vec2 Xi = vec2(
+            float(i) / float(SAMPLE_COUNT),
+            fract(sin(float(i) * 12.9898) * 43758.5453)
+        );
+
+        vec3 H = importanceSampleGGX(Xi, N, pc.roughness);
+        vec3 L = normalize(2.0 * dot(V, H) * H - V);
+
+        float NdotL = max(dot(N, L), 0.0);
+        if (NdotL > 0.0)
+        {
+            prefiltered += texture(uEnvMap, L).rgb * NdotL;
+            totalWeight += NdotL;
+        }
+    }
+
+    prefiltered /= max(totalWeight, 1e-4);
+
+    imageStore(
+        uOutImage,
+        ivec3(gid.xy, int(face)),
+        vec4(prefiltered, 1.0)
+    );
+}

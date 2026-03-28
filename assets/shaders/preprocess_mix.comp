@@ -1,0 +1,430 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "./common.glsl"
+
+layout (std430, set = 0, binding = 0) readonly buffer Vertices {
+    Vertex vertices[];
+};
+
+layout (std430, set = 0, binding = 1) readonly buffer Cov3Ds {
+    float cov3ds[];
+};
+
+layout (std140, set = 1, binding = 0) uniform Params {
+    vec4 camera_position;
+    mat4 view_mat;
+    mat4 proj_mat;
+    mat4 view_proj;
+    uint width;
+    uint height;
+    float tan_fovx;
+    float tan_fovy;
+    vec4 gaze_params;
+};
+
+// outputs (same as preprocess)
+layout (std430, set = 1, binding = 1) writeonly buffer VertexAttributes {
+    VertexAttribute attr[];
+};
+
+layout (std430, set = 1, binding = 2) writeonly buffer NumTilesOverlap {
+    uint tiles_overlap[];
+};
+
+// set2: mesh tile stats (RGBA16F/RGBA32F sampled)
+// xyz: (maxDepth01, minDepth01, coverage)
+// w  : hitRatio (0..1) [NEW, optional]
+layout (set = 2, binding = 0) uniform sampler2D uMeshTileStats;
+
+layout (local_size_x = TILE_WIDTH * TILE_HEIGHT, local_size_y = 1, local_size_z = 1) in;
+
+const uint TILE_SIZE = 16u;
+
+// ==========================================
+// Depth semantics (your pipeline: normal-Z)
+// ==========================================
+const float FAR_DEPTH = 1.0;
+
+// ======================
+// Hard occlusion tuning
+// ======================
+
+// We no longer disable near hard-kill entirely.
+// Instead: near uses stricter gating.
+const float NEAR_STRICT_Z = 1.2;
+
+// far params
+const float CULL_EPS_FAR        = 0.015;
+const float GAUSS_THICKNESS_FAR = 0.020;
+
+// near params (more conservative)
+const float CULL_EPS_NEAR        = 0.025;
+const float GAUSS_THICKNESS_NEAR = 0.030;
+
+// majority gating
+const float REGION_SOLID_RATIO_TH = 0.80;  // >=80% solid => region solid
+const int   REGION_MAX_NON_SOLID  = 1;     // allow up to 1 weak tile in window
+
+// sampling radius
+const int MAX_RADIUS = 1;
+
+// solidity thresholds
+// Base threshold is tuned for sampled coverage (not exact coverage), so don't set too high.
+const float SOLID_COVERAGE_TH_FAR  = 0.60;
+const float SOLID_COVERAGE_TH_NEAR = 0.75;
+
+// Base range threshold; will be adapted by coverage
+const float SOLID_RANGE_BASE_FAR   = 0.020;
+const float SOLID_RANGE_BASE_NEAR  = 0.012;
+
+// validity
+const float TILE_MIN_VALID = 0.0;
+const float TILE_MAX_VALID = 1.0;
+
+// -------------------- helpers --------------------
+bool isFinite01(float d)
+{
+    return !isnan(d) && !isinf(d) && (d >= TILE_MIN_VALID) && (d <= TILE_MAX_VALID);
+}
+
+bool isBackgroundDepth(float d)
+{
+    return abs(d - FAR_DEPTH) <= 1e-6;
+}
+
+// compare (splatFrontDepth) > tileDepth + eps
+bool splatDefinitelyBehindTile(float splatDepth01, float tileDepth01, float eps, float thickness)
+{
+    float dFront = splatDepth01 - thickness;
+    return dFront > (tileDepth01 + eps);
+}
+
+int chooseSampleRadius(float radiiPx)
+{
+    if (radiiPx >= 10.0) return min(MAX_RADIUS, 1);
+    return 0;
+}
+
+// Adaptive solidity:
+// - require coverage high
+// - require depthRange small (adaptive by cov)
+// - not background
+bool isSolidOccluder(float maxD, float minD, float cov, float hitRatio, float covTh, float rangeBase)
+{
+    if (!isFinite01(maxD) || !isFinite01(minD) || !isFinite01(cov)) return false;
+    if (isBackgroundDepth(maxD)) return false;
+
+    // hitRatio can help: if sampling missed too much => unreliable => non-solid
+    // (backward compatible: even if w isn't used, it will just be 0..1)
+    if (!isFinite01(hitRatio)) hitRatio = cov;
+    if (hitRatio < (covTh * 0.75)) return false;
+
+    if (cov < covTh) return false;
+
+    float range = abs(maxD - minD);
+
+    // adaptive range threshold:
+    // higher coverage => stricter on range
+    // lower coverage => a little looser, but it won't pass covTh anyway
+    float rangeTh = rangeBase * (0.60 + 0.40 * cov);
+
+    return range < rangeTh;
+}
+
+// ---------- original helpers from your preprocess ----------
+mat3 get_projection_jacobian_approx(vec3 t) {
+    float limx = 1.3 * tan_fovx;
+    float limy = 1.3 * tan_fovy;
+    float txtz = t.x / t.z;
+    float tytz = t.y / t.z;
+    t.x = min(limx, max(-limx, txtz)) * t.z;
+    t.y = min(limy, max(-limy, tytz)) * t.z;
+
+    float focal_x = float(width) / (2.0 * tan_fovx);
+    float focal_y = float(height) / (2.0 * tan_fovy);
+
+    return mat3(
+        focal_x / t.z, 0, -(focal_x * t.x) / (t.z * t.z),
+        0, focal_y / t.z, -(focal_y * t.y) / (t.z * t.z),
+        0, 0, 0
+    );
+}
+
+mat2 compute_cov2d(vec3 cam) {
+    mat4 view_mat_local = view_mat;
+
+    view_mat_local[0][1] *= -1.0;
+    view_mat_local[1][1] *= -1.0;
+    view_mat_local[2][1] *= -1.0;
+    view_mat_local[3][1] *= -1.0;
+    view_mat_local[0][2] *= -1.0;
+    view_mat_local[1][2] *= -1.0;
+    view_mat_local[2][2] *= -1.0;
+    view_mat_local[3][2] *= -1.0;
+
+    uint index = gl_GlobalInvocationID.x;
+    mat3 J = get_projection_jacobian_approx(cam);
+    mat3 W = transpose(mat3(view_mat_local));
+    mat3 Sigma = mat3(
+        cov3ds[index * 6],     cov3ds[index * 6 + 1], cov3ds[index * 6 + 2],
+        cov3ds[index * 6 + 1], cov3ds[index * 6 + 3], cov3ds[index * 6 + 4],
+        cov3ds[index * 6 + 2], cov3ds[index * 6 + 4], cov3ds[index * 6 + 5]
+    );
+    mat3 T = W * J;
+    mat3 cov2d = transpose(T) * Sigma * T;
+    cov2d[0][0] += 0.3;
+    cov2d[1][1] += 0.3;
+    return mat2(cov2d);
+}
+
+float ndc2Pix(float v, int S) {
+    return ((v + 1.0) * float(S) - 1.0) * 0.5;
+}
+
+vec3 get_sh_vec3(uint ind) {
+    uint index = gl_GlobalInvocationID.x;
+    return vec3(
+        vertices[index].sh[ind * 3],
+        vertices[index].sh[ind * 3 + 1],
+        vertices[index].sh[ind * 3 + 2]
+    );
+}
+
+vec3 compute_sh() {
+    uint index = gl_GlobalInvocationID.x;
+
+    vec3 ray_direction = vertices[index].position.xyz - camera_position.xyz;
+    ray_direction /= length(ray_direction);
+    float x = ray_direction.x, y = ray_direction.y, z = ray_direction.z;
+
+    vec3 c = SH_C0 * get_sh_vec3(0);
+    c -= SH_C1 * get_sh_vec3(1) * y;
+    c += SH_C1 * get_sh_vec3(2) * z;
+    c -= SH_C1 * get_sh_vec3(3) * x;
+
+    c += SH_C2[0] * get_sh_vec3(4) * x * y;
+    c += SH_C2[1] * get_sh_vec3(5) * y * z;
+    c += SH_C2[2] * get_sh_vec3(6) * (2.0 * z * z - x * x - y * y);
+    c += SH_C2[3] * get_sh_vec3(7) * z * x;
+    c += SH_C2[4] * get_sh_vec3(8) * (x * x - y * y);
+
+    c += SH_C3[0] * get_sh_vec3(9)  * (3.0 * x * x - y * y) * y;
+    c += SH_C3[1] * get_sh_vec3(10) * x * y * z;
+    c += SH_C3[2] * get_sh_vec3(11) * (4.0 * z * z - x * x - y * y) * y;
+    c += SH_C3[3] * get_sh_vec3(12) * z * (2.0 * z * z - 3.0 * x * x - 3.0 * y * y);
+    c += SH_C3[4] * get_sh_vec3(13) * x * (4.0 * z * z - x * x - y * y);
+    c += SH_C3[5] * get_sh_vec3(14) * (x * x - y * y) * z;
+    c += SH_C3[6] * get_sh_vec3(15) * x * (x * x - 3.0 * y * y);
+
+    c += 0.5;
+    return max(c, vec3(0.0));
+}
+
+float NdcZ_To_Depth01(float ndcZ)
+{
+    float d;
+    if (ndcZ >= -0.01 && ndcZ <= 1.01) {
+        d = ndcZ;
+    } else {
+        d = ndcZ * 0.5 + 0.5;
+    }
+    return clamp(d, 0.0, 1.0);
+}
+
+// ----------------------------------------------------------
+
+void main()
+{
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= vertices.length()) return;
+
+    ivec2 tile_shape = ivec2(
+        int((width  + TILE_WIDTH  - 1) / TILE_WIDTH),
+        int((height + TILE_HEIGHT - 1) / TILE_HEIGHT)
+    );
+
+    tiles_overlap[index] = 0;
+    attr[index].color_radii.w = 0.0;
+
+    vec4 p_hom = view_proj * vertices[index].position;
+    float inv_w = 1.0 / p_hom.w;
+    vec3 ndc = p_hom.xyz * inv_w;
+
+    mat4 view_mat_local = view_mat;
+    view_mat_local[0][1] *= -1.0;
+    view_mat_local[1][1] *= -1.0;
+    view_mat_local[2][1] *= -1.0;
+    view_mat_local[3][1] *= -1.0;
+    view_mat_local[0][2] *= -1.0;
+    view_mat_local[1][2] *= -1.0;
+    view_mat_local[2][2] *= -1.0;
+    view_mat_local[3][2] *= -1.0;
+
+    vec4 p_view = view_mat_local * vertices[index].position;
+    if (p_view.z <= 0.2) return;
+
+    mat2 cov2d = compute_cov2d(p_view.xyz);
+    float det = determinant(cov2d);
+    if (det <= 0.0) return;
+
+    mat2 conic = inverse(cov2d);
+    attr[index].conic_opacity.xyz = vec3(conic[0][0], conic[0][1], conic[1][1]);
+    attr[index].conic_opacity.w   = vertices[index].scale_opacity.w;
+
+    float mid = 0.5 * (cov2d[0][0] + cov2d[1][1]);
+    float lambda1 = mid + sqrt(max(0.1, mid * mid - det));
+    float lambda2 = mid - sqrt(max(0.1, mid * mid - det));
+    float lambda  = max(lambda1, lambda2);
+    float radii   = ceil(3.0 * sqrt(lambda));
+
+    vec2 uv = vec2(
+        ndc2Pix(ndc.x, int(width)),
+        ndc2Pix(ndc.y, int(height))
+    );
+
+    // ============================================================
+    // Hard occlusion: improved SOLID occluder gating
+    // ============================================================
+    float depth01 = NdcZ_To_Depth01(ndc.z);
+
+    // decide near/far param set
+    bool isNear = (p_view.z < NEAR_STRICT_Z);
+
+    float covTh     = isNear ? SOLID_COVERAGE_TH_NEAR : SOLID_COVERAGE_TH_FAR;
+    float rangeBase = isNear ? SOLID_RANGE_BASE_NEAR  : SOLID_RANGE_BASE_FAR;
+    float eps       = isNear ? CULL_EPS_NEAR          : CULL_EPS_FAR;
+    float thickness = isNear ? GAUSS_THICKNESS_NEAR   : GAUSS_THICKNESS_FAR;
+
+    // Now: always allow tileCull, but near is more strict by covTh/rangeBase/eps/thickness
+    {
+        ivec2 tileMax = ivec2(
+            int((width  + TILE_SIZE - 1u) / TILE_SIZE),
+            int((height + TILE_SIZE - 1u) / TILE_SIZE)
+        );
+
+        ivec2 tileCenter = ivec2(int(floor(uv.x / float(TILE_SIZE))),
+                                 int(floor(uv.y / float(TILE_SIZE))));
+        tileCenter = clamp(tileCenter, ivec2(0), tileMax - ivec2(1));
+
+        int radius = chooseSampleRadius(radii);
+
+        int solidCount = 0;
+        int totalCount = 0;
+        int nonSolidCount = 0;
+
+        float regionMaxDepth = 0.0;
+        bool hasDepth = false;
+
+        for (int oy = -radius; oy <= radius; ++oy) {
+            for (int ox = -radius; ox <= radius; ++ox) {
+
+                ivec2 t = clamp(tileCenter + ivec2(ox, oy), ivec2(0), tileMax - ivec2(1));
+                vec4 s = texelFetch(uMeshTileStats, t, 0);
+
+                float maxD = s.x;
+                float minD = s.y;
+                float cov  = s.z;
+                float hitR = s.w;
+
+                totalCount++;
+
+                // invalid/background => non-solid
+                if (!isFinite01(maxD) || !isFinite01(minD) || !isFinite01(cov) || isBackgroundDepth(maxD)) {
+                    nonSolidCount++;
+                    continue;
+                }
+
+                // solid test
+                if (!isSolidOccluder(maxD, minD, cov, hitR, covTh, rangeBase)) {
+                    nonSolidCount++;
+                    continue;
+                }
+
+                solidCount++;
+
+                // conservative for normal-Z: use MAX depth in region
+                if (!hasDepth) { regionMaxDepth = maxD; hasDepth = true; }
+                else           { regionMaxDepth = max(regionMaxDepth, maxD); }
+            }
+        }
+
+        float solidRatio = (totalCount > 0) ? (float(solidCount) / float(totalCount)) : 0.0;
+
+        // improved regionSolid:
+        // - allow <=1 non-solid tile
+        // - solidRatio >= 0.8
+        bool regionSolid =
+            hasDepth &&
+            (solidRatio >= REGION_SOLID_RATIO_TH) &&
+            (nonSolidCount <= REGION_MAX_NON_SOLID);
+
+        if (regionSolid) {
+            bool behind = splatDefinitelyBehindTile(depth01, regionMaxDepth, eps, thickness);
+
+            float ratio = behind ? 1.0 : 0.0;
+            if (ratio >= 0.75) {
+                return;
+            }
+        }
+    }
+    // ===== end hard occlusion =====
+
+    /* ============================================================
+       Gaze-based Splat LOD / Drop (SCREEN CENTER)
+       ============================================================ */
+    vec2 gazePx = gaze_params.xy;
+
+    float distPx  = length(uv - gazePx);
+    float R0 = gaze_params.z;
+    float R1 = gaze_params.w;
+
+    if (R1 <= R0) {
+        gazePx = vec2(float(width) * 0.5, float(height) * 0.5);
+        R0 = float(min(width, height)) * 0.15;
+        R1 = float(min(width, height)) * 0.35;
+    }
+
+    float t = clamp((distPx - R0) / max(1.0, (R1 - R0)), 0.0, 1.0);
+
+    float lodScale = mix(1.0, 0.55, t);
+    radii *= lodScale;
+
+    vec3 sh_color = compute_sh();
+    float sh_energy = max(max(sh_color.r, sh_color.g), sh_color.b);
+    float opacity   = vertices[index].scale_opacity.w;
+
+    float importance = radii * opacity * sh_energy;
+    importance = clamp(importance, 0.0, 10.0);
+
+    if (t > 0.85) {
+        float imp = radii * vertices[index].scale_opacity.w;
+        if (imp < 0.15 && radii < 3.0) {
+            if (radii < 2.5)
+                return;
+        }
+    }
+
+    radii = max(radii, 1.0);
+    /* ============================================================ */
+
+    uvec4 bounding_box = uvec4(
+        uint(clamp(int((uv.x - radii) / float(TILE_WIDTH)),  0, tile_shape.x)),
+        uint(clamp(int((uv.y - radii) / float(TILE_HEIGHT)), 0, tile_shape.y)),
+        uint(clamp(int((uv.x + radii + float(TILE_WIDTH)  - 1.0) / float(TILE_WIDTH)),  0, tile_shape.x)),
+        uint(clamp(int((uv.y + radii + float(TILE_HEIGHT) - 1.0) / float(TILE_HEIGHT)), 0, tile_shape.y))
+    );
+
+    uint num_tiles_overlap =
+        (bounding_box.z - bounding_box.x) *
+        (bounding_box.w - bounding_box.y);
+
+    if (num_tiles_overlap == 0) return;
+
+    attr[index].aabb             = bounding_box;
+    tiles_overlap[index]         = num_tiles_overlap;
+    attr[index].depth            = p_view.z;
+    attr[index].depth01          = depth01;
+    attr[index].color_radii.w    = radii;
+    attr[index].color_radii.xyz  = sh_color;
+    attr[index].uv               = uv;
+}

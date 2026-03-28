@@ -1,0 +1,145 @@
+#version 450
+layout(local_size_x=8, local_size_y=8) in;
+
+layout(set=0,binding=0) uniform sampler2D uColorA;  // glTF
+layout(set=0,binding=1) uniform sampler2D uDepthA;
+
+// keep these bindings for compatibility, but NOT USED (decoupled)
+layout(set=0,binding=2) uniform sampler2D uColorB;
+layout(set=0,binding=3) uniform sampler2D uDepthB;
+
+// IMPORTANT: uBlurPrev must be sampled as texelFetch (no filtering)
+layout(set=0,binding=4) uniform sampler2D uBlurPrev; // r8
+layout(set=0,binding=5, r8) uniform writeonly image2D uBlurNext;
+
+layout(push_constant) uniform PC {
+    int width;
+    int height;
+
+    float emaAlpha;
+    float covTh;          // unused (kept)
+    float covStrongTh;    // unused (kept)
+    float baseSoft;
+
+    float maxSoft;
+    float depthTolBase;   // used as depth soft bias
+    float depthTolK;      // used as depth soft bias
+    float reserved0;
+
+    int styleLock;
+    int preset;
+    float reserved1;
+    float reserved2;
+} pc;
+
+float saturate(float x){ return clamp(x,0.0,1.0); }
+float luma(vec3 c){ return dot(c, vec3(0.2126,0.7152,0.0722)); }
+
+bool depthValid01(float d) { return (d > 1e-6) && (d < 1.0 - 1e-6); }
+
+float DepthTol(float d){
+    return pc.depthTolBase + pc.depthTolK * d;
+}
+
+// A-edge / detail energy (stable)
+float detailEnergyA(ivec2 p)
+{
+    vec3 c0 = texelFetch(uColorA, p, 0).rgb;
+    vec3 cx = texelFetch(uColorA, clamp(p + ivec2(1,0), ivec2(0), ivec2(pc.width-1, pc.height-1)), 0).rgb;
+    vec3 cy = texelFetch(uColorA, clamp(p + ivec2(0,1), ivec2(0), ivec2(pc.width-1, pc.height-1)), 0).rgb;
+    vec3 c1 = texelFetch(uColorA, clamp(p + ivec2(-1,0), ivec2(0), ivec2(pc.width-1, pc.height-1)), 0).rgb;
+    vec3 c2 = texelFetch(uColorA, clamp(p + ivec2(0,-1), ivec2(0), ivec2(pc.width-1, pc.height-1)), 0).rgb;
+
+    float L0 = luma(c0);
+    float gx = 0.5 * (luma(cx) - luma(c1));
+    float gy = 0.5 * (luma(cy) - luma(c2));
+    float g  = sqrt(gx*gx + gy*gy);
+
+    float mu  = (L0 + luma(cx) + luma(cy) + luma(c1) + luma(c2)) * 0.2;
+    float var = ((L0-mu)*(L0-mu) +
+                 (luma(cx)-mu)*(luma(cx)-mu) +
+                 (luma(cy)-mu)*(luma(cy)-mu) +
+                 (luma(c1)-mu)*(luma(c1)-mu) +
+                 (luma(c2)-mu)*(luma(c2)-mu)) * 0.2;
+
+    float sig = sqrt(max(var, 0.0));
+
+    // detail energy
+    return 0.65 * g + 0.85 * sig;
+}
+
+// depth edge indicator on A
+float depthEdgeA(ivec2 p, float d0)
+{
+    float dx = texelFetch(uDepthA, clamp(p + ivec2(1,0), ivec2(0), ivec2(pc.width-1, pc.height-1)), 0).r;
+    float dy = texelFetch(uDepthA, clamp(p + ivec2(0,1), ivec2(0), ivec2(pc.width-1, pc.height-1)), 0).r;
+    if (!depthValid01(d0) || !depthValid01(dx) || !depthValid01(dy)) return 0.0;
+
+    float tol = DepthTol(d0);
+    float g = max(abs(dx - d0), abs(dy - d0));
+    return saturate(g / max(tol, 1e-6));
+}
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if(p.x>=pc.width || p.y>=pc.height) return;
+
+    float prev = texelFetch(uBlurPrev, p, 0).r;
+
+    float dA = texelFetch(uDepthA, p, 0).r;
+    bool hasA = depthValid01(dA) && (abs(dA - 1.0) > 1e-5);
+
+    // If no A geometry: blurmap should be 0 (don’t affect background)
+    float target = 0.0;
+
+    if (hasA)
+    {
+        // baseline soften for A object
+        target = pc.baseSoft;
+
+        // Use depth-edge + low-detail bias:
+        // - near silhouette => need blur to match 3DGS softness
+        // - smooth regions => blur a bit more
+        float de = depthEdgeA(p, dA);                  // 0..1
+        float det = detailEnergyA(p);                  // energy
+        float detailMask = smoothstep(0.015, 0.075, det); // 0=flat,1=detail
+
+        // silhouette boost
+        float sil = smoothstep(0.06, 0.22, de);
+
+        // flat region gets more blur, detailed region gets less
+        float flatBoost = (1.0 - detailMask);
+
+        float presetStrong = (pc.preset == 1) ? 1.0 : 0.0;
+
+        float w = 0.0;
+        w += 0.45 * flatBoost;
+        w += mix(0.25, 0.40, presetStrong) * sil;
+
+        // far bias: reduce blur far away
+        float far = smoothstep(0.70, 0.98, dA);
+        w *= (1.0 - 0.55 * far);
+
+        target += w * (pc.maxSoft - pc.baseSoft);
+        target = clamp(target, 0.0, pc.maxSoft);
+
+        // stability: if very detailed, clamp
+        target *= mix(1.0, 0.65, detailMask);
+    }
+
+    // --- temporal stabilize ---
+    float alpha = pc.emaAlpha;
+
+    // If styleLock, freeze heavily
+    if (pc.styleLock != 0) alpha = 0.02;
+
+    float outv = mix(prev, target, alpha);
+
+    // hysteresis
+    float diff = abs(outv - prev);
+    float hyst = 0.0030;
+    if (diff < hyst) outv = prev;
+
+    imageStore(uBlurNext, p, vec4(outv,0,0,1));
+}

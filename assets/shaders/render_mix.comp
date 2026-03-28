@@ -1,0 +1,175 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "./common.glsl"
+
+layout (std430, set = 0, binding = 0) readonly buffer Vertices {
+    VertexAttribute attr[];
+};
+
+layout (std430, set = 0, binding = 1) readonly buffer Boundaries {
+    uint boundaries[];
+};
+
+layout (std430, set = 0, binding = 2) readonly buffer SortedVertices {
+    uint sorted_vertices[];
+};
+
+// set 1: outputs
+layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D output_image;
+layout(set = 1, binding = 1, r32f)   uniform writeonly image2D output_depth;
+
+// set 2: occluder depth (glTF depth)
+layout(set = 2, binding = 0) uniform sampler2D uMeshDepth;
+
+// push constants (must match GsRenderPass::MixPC)
+layout(push_constant) uniform PC
+{
+    uint  width;
+    uint  height;
+
+    float projA;
+    float projB;
+    float projC;
+
+    float farDepth; // 1 for normal-Z, 0 for reversed-Z
+} pc;
+
+layout (local_size_x = TILE_WIDTH, local_size_y = TILE_HEIGHT, local_size_z = 1) in;
+
+// ============================================================
+// Occludable semantics (CRITICAL)
+// output_depth represents: "depth when GS should occlude glTF"
+// ============================================================
+
+const float OCC_TH    = 0.30;
+const float OCC_KNEE  = 0.08;
+
+// thin-object compensation
+const float THIN_COV_TH   = 0.12;
+const float THIN_ALPHA_TH = 0.22;
+
+bool isFiniteF(float x) { return !isnan(x) && !isinf(x); }
+
+bool isReversedZ()
+{
+    return pc.farDepth < 0.5;
+}
+
+bool isSplatBehindMesh(float splatD, float meshD, float eps)
+{
+    if (isReversedZ()) {
+        // reversed-Z: larger is closer
+        return splatD < (meshD - eps);
+    } else {
+        // normal-Z: smaller is closer
+        return splatD > (meshD + eps);
+    }
+}
+
+float occAlphaFromCoverage(float cov)
+{
+    return smoothstep(OCC_TH - OCC_KNEE, OCC_TH + OCC_KNEE, cov);
+}
+
+void main()
+{
+    uint tileX  = gl_WorkGroupID.x;
+    uint tileY  = gl_WorkGroupID.y;
+    uint localX = gl_LocalInvocationID.x;
+    uint localY = gl_LocalInvocationID.y;
+
+    uvec2 curr_uv_u = uvec2(tileX * TILE_WIDTH + localX, tileY * TILE_HEIGHT + localY);
+    if (curr_uv_u.x >= pc.width || curr_uv_u.y >= pc.height) return;
+
+    ivec2 curr_uv = ivec2(curr_uv_u);
+
+    // ---- fetch mesh depth ----
+    float meshD = texelFetch(uMeshDepth, curr_uv, 0).r;
+    bool hasMesh = (abs(meshD - pc.farDepth) > 1e-6);
+
+    // robust depth epsilon
+    float dEps = 2e-4;
+    if (!isReversedZ()) {
+        dEps += 8e-4 * (1.0 - clamp(meshD, 0.0, 1.0));
+    } else {
+        dEps += 8e-4 * (clamp(meshD, 0.0, 1.0));
+    }
+
+    uint tiles_width = (pc.width + TILE_WIDTH - 1) / TILE_WIDTH;
+    uint tileIndex = tileX + tileY * tiles_width;
+
+    uint start = boundaries[tileIndex * 2 + 0];
+    uint end   = boundaries[tileIndex * 2 + 1];
+
+    float T = 1.0;
+    vec3  premul = vec3(0.0);
+
+    float minDepth01  = pc.farDepth;
+    bool  hasMinDepth = false;
+
+    float maxAlphaSeen = 0.0;
+
+    for (uint i = start; i < end; ++i)
+    {
+        uint vtx = sorted_vertices[i];
+
+        vec2 uv = attr[vtx].uv;
+        vec2 distance = uv - vec2(curr_uv_u);
+
+        vec4 co = attr[vtx].conic_opacity;
+
+        float power = -0.5 * (co.x * distance.x * distance.x
+                            + co.z * distance.y * distance.y)
+                    - co.y * distance.x * distance.y;
+
+        if (power > 0.0) continue;
+
+        float alpha = min(0.99, co.w * exp(power));
+        if (alpha < (1.0 / 255.0)) continue;
+
+        float d01 = attr[vtx].depth01;
+        if (!isFiniteF(d01)) continue;
+        d01 = clamp(d01, 0.0, 1.0);
+
+        // glTF mesh occludes GS
+        if (hasMesh && isSplatBehindMesh(d01, meshD, dEps)) {
+            continue;
+        }
+
+        // conservative front-most depth among accepted contributors
+        if (!hasMinDepth) {
+            minDepth01 = d01;
+            hasMinDepth = true;
+        } else {
+            if (!isReversedZ()) minDepth01 = min(minDepth01, d01);
+            else                minDepth01 = max(minDepth01, d01);
+        }
+
+        maxAlphaSeen = max(maxAlphaSeen, alpha);
+
+        // composite
+        premul += attr[vtx].color_radii.xyz * (alpha * T);
+        T *= (1.0 - alpha);
+
+        if (T < 1e-4) break;
+    }
+
+    float coverage = 1.0 - T;
+
+    // output_image: premult RGB + coverage(alpha)
+    imageStore(output_image, curr_uv, vec4(premul, coverage));
+
+    // output_depth: occludable depth only
+    float outD = pc.farDepth;
+
+    float occA_final = occAlphaFromCoverage(coverage);
+    bool strongOcc = (occA_final >= 0.5) || (coverage >= OCC_TH);
+
+    bool thinOcc = (coverage >= THIN_COV_TH) && (maxAlphaSeen >= THIN_ALPHA_TH);
+
+    if ((strongOcc || thinOcc) && hasMinDepth) {
+        outD = minDepth01;
+    }
+
+    imageStore(output_depth, curr_uv, vec4(outD, 0.0, 0.0, 0.0));
+}

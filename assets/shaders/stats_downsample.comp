@@ -1,0 +1,51 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set=0, binding=0) uniform sampler2D uColorA_full;
+layout(set=0, binding=1) uniform sampler2D uColorB_full;
+
+layout(set=0, binding=2, rgba16f) uniform writeonly image2D outStatsA;
+layout(set=0, binding=3, rgba16f) uniform writeonly image2D outStatsB;
+
+layout(push_constant) uniform PC
+{
+    int fullW;
+    int fullH;
+    int statsW;
+    int statsH;
+} pc;
+
+// simple 2x2 box sample (stable, fast)
+vec4 sampleBox(sampler2D tex, vec2 uv, vec2 texel)
+{
+    vec4 s = vec4(0.0);
+    s += texture(tex, uv + texel * vec2(-0.25, -0.25));
+    s += texture(tex, uv + texel * vec2( 0.25, -0.25));
+    s += texture(tex, uv + texel * vec2(-0.25,  0.25));
+    s += texture(tex, uv + texel * vec2( 0.25,  0.25));
+    return s * 0.25;
+}
+
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= pc.statsW || p.y >= pc.statsH) return;
+
+    // map stats pixel center -> full uv
+    vec2 uv = (vec2(p) + vec2(0.5)) / vec2(pc.statsW, pc.statsH);
+
+    // compute texel size in full-res
+    vec2 texel = 1.0 / vec2(max(pc.fullW,1), max(pc.fullH,1));
+
+    vec4 a = sampleBox(uColorA_full, uv, texel);
+    vec4 b = sampleBox(uColorB_full, uv, texel);
+
+    // clamp to sane range
+    a = clamp(a, vec4(0.0), vec4(64.0));
+    b = clamp(b, vec4(0.0), vec4(64.0));
+
+    imageStore(outStatsA, p, a);
+    imageStore(outStatsB, p, b);
+}

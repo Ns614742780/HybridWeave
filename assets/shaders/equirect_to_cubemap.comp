@@ -1,0 +1,61 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// set=0 binding=0 : equirect sampler2D
+layout(set = 0, binding = 0) uniform sampler2D uEquirect;
+
+// set=0 binding=1 : cubemap storage (2D array, 6 layers)
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2DArray uCubeOut;
+
+layout(push_constant) uniform PC
+{
+    uint cubeSize;
+} pc;
+
+const float PI = 3.14159265359;
+
+vec3 faceUVToDir(uint face, vec2 uv)
+{
+    // uv in [-1,1]
+    // faces follow common +X,-X,+Y,-Y,+Z,-Z convention
+    if (face == 0u) return normalize(vec3( 1.0, -uv.y, -uv.x)); // +X
+    if (face == 1u) return normalize(vec3(-1.0, -uv.y,  uv.x)); // -X
+    if (face == 2u) return normalize(vec3( uv.x,  1.0,  uv.y)); // +Y
+    if (face == 3u) return normalize(vec3( uv.x, -1.0, -uv.y)); // -Y
+    if (face == 4u) return normalize(vec3( uv.x, -uv.y,  1.0)); // +Z
+    return           normalize(vec3(-uv.x, -uv.y, -1.0));        // -Z
+}
+
+vec2 dirToEquirectUV(vec3 dir)
+{
+    dir = normalize(dir);
+    float phi   = atan(dir.z, dir.x);
+    float theta = asin(clamp(dir.y, -1.0, 1.0));
+    float u = phi / (2.0 * PI) + 0.5;
+    float v = 0.5 - theta / PI;
+    return vec2(u, v);
+}
+
+void main()
+{
+    uvec3 gid = gl_GlobalInvocationID.xyz;
+
+    uint x = gid.x;
+    uint y = gid.y;
+    uint face = gid.z;
+
+    if (x >= pc.cubeSize || y >= pc.cubeSize || face >= 6u)
+        return;
+
+    // pixel center
+    vec2 uv01 = (vec2(x, y) + vec2(0.5)) / float(pc.cubeSize); // [0,1]
+    vec2 uv = uv01 * 2.0 - 1.0; // [-1,1]
+
+    vec3 dir = faceUVToDir(face, uv);
+    vec2 euv = dirToEquirectUV(dir);
+
+    vec3 c = texture(uEquirect, euv).rgb;
+
+    imageStore(uCubeOut, ivec3(int(x), int(y), int(face)), vec4(c, 1.0));
+}

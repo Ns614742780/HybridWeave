@@ -1,0 +1,1 @@
+Place bicycle.ply here after downloading it from the GitHub Release page.

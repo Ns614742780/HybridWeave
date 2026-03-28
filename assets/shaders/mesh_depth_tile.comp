@@ -1,0 +1,116 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "./common.glsl"
+
+// set0: full-res mesh depth (sampled)
+layout(set = 0, binding = 0) uniform sampler2D uMeshDepth;
+
+// set1: tile stats output (RGBA16F/RGBA32F storage image)
+// xyz: (maxDepth01, minDepth01, coverage)
+// w  : hitRatio (0..1)  [NEW, backward-compatible]
+layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D outTileStats;
+
+// push constants: must match GsMixRenderPass::MeshTilePC
+layout(push_constant) uniform PC
+{
+    uint  width;
+    uint  height;
+    float farDepth; // 1 for normal-Z, 0 for reversed-Z
+    float _pad0;
+} pc;
+
+// One workgroup per tile
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+const uint TILE_SIZE = 16u;
+
+// sample grid: 4x4 + center => 17 samples
+const uint GRID_N = 4u;
+
+bool hasMeshDepth(float d)
+{
+    return abs(d - pc.farDepth) > 1e-6;
+}
+
+float safeFetchDepth(uint x, uint y)
+{
+    x = min(x, pc.width  - 1u);
+    y = min(y, pc.height - 1u);
+    return texelFetch(uMeshDepth, ivec2(int(x), int(y)), 0).r;
+}
+
+void main()
+{
+    uvec2 tile = gl_GlobalInvocationID.xy;
+
+    uint x0 = tile.x * TILE_SIZE;
+    uint y0 = tile.y * TILE_SIZE;
+
+    if (x0 >= pc.width || y0 >= pc.height) {
+        return;
+    }
+
+    uint x1 = min(x0 + TILE_SIZE, pc.width);
+    uint y1 = min(y0 + TILE_SIZE, pc.height);
+
+    // init
+    float maxD = 0.0;
+    float minD = 1.0;
+    uint  hit  = 0u;
+
+    // --- 4x4 grid sampling inside the tile ---
+    // sample positions: (x0 + (k+0.5)/GRID_N * tileW, y0 + ...)
+    uint tileW = x1 - x0;
+    uint tileH = y1 - y0;
+
+    // avoid div by 0
+    if (tileW == 0u || tileH == 0u) {
+        imageStore(outTileStats, ivec2(tile), vec4(pc.farDepth, pc.farDepth, 0.0, 0.0));
+        return;
+    }
+
+    for (uint gy = 0u; gy < GRID_N; ++gy) {
+        for (uint gx = 0u; gx < GRID_N; ++gx) {
+            // fixed-point sampling, center of subcell
+            uint sx = x0 + ( (2u * gx + 1u) * tileW ) / (2u * GRID_N);
+            uint sy = y0 + ( (2u * gy + 1u) * tileH ) / (2u * GRID_N);
+
+            float d = safeFetchDepth(sx, sy);
+            if (!hasMeshDepth(d)) continue;
+
+            hit++;
+            maxD = max(maxD, d);
+            minD = min(minD, d);
+        }
+    }
+
+    // --- center sample (extra stability) ---
+    {
+        uint cx = x0 + tileW / 2u;
+        uint cy = y0 + tileH / 2u;
+        float d = safeFetchDepth(cx, cy);
+        if (hasMeshDepth(d)) {
+            hit++;
+            maxD = max(maxD, d);
+            minD = min(minD, d);
+        }
+    }
+
+    // coverage estimate from sampling (not exact pixel coverage, but robust enough)
+    const float sampleCount = float(GRID_N * GRID_N + 1u);
+    float hitRatio = float(hit) / sampleCount;
+
+    // map hitRatio -> coverage: keep it conservative (avoid false solid on foliage)
+    // Empirically: coverage ~= hitRatio is OK, but we clamp.
+    float coverage = clamp(hitRatio, 0.0, 1.0);
+
+    // if no mesh sample => mark as background
+    if (hit == 0u) {
+        maxD = pc.farDepth;
+        minD = pc.farDepth;
+        coverage = 0.0;
+        hitRatio = 0.0;
+    }
+
+    imageStore(outTileStats, ivec2(tile), vec4(maxD, minD, coverage, hitRatio));
+}

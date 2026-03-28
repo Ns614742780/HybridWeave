@@ -1,0 +1,27 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D uCurr;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D uHistoryRead;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D uOut;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D uHistoryWrite;
+
+layout(push_constant) uniform PushConstants {
+    uint uWidth;
+    uint uHeight;
+    uint uFrameIndex;
+} pc;
+
+void main()
+{
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= pc.uWidth || gid.y >= pc.uHeight) return;
+
+    ivec2 p = ivec2(gid);
+    vec4 curr = imageLoad(uCurr, p);
+    vec4 hist = imageLoad(uHistoryRead, p);
+    vec4 outc = (curr.a > 0.5) ? vec4(curr.rgb,1.0) : hist;
+    imageStore(uOut, p, outc);
+    imageStore(uHistoryWrite, p, outc);
+}
