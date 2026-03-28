@@ -22,8 +22,6 @@ compile_commands.json
 
 # Compiled binaries and debug symbols
 *.exe
-*.dll
-*.lib
 *.obj
 *.pdb
 *.ilk
