@@ -6,15 +6,22 @@ if (MSVC)
     add_compile_options("/utf-8")
 endif()
 
-set(VULKAN_ROOT ${CMAKE_SOURCE_DIR}/thirdParty/vulkan)
+# --------------------------------------------------
+# Vulkan SDK
+# --------------------------------------------------
+if(NOT DEFINED ENV{VULKAN_SDK})
+    message(FATAL_ERROR "VULKAN_SDK environment variable is not set. Please install the Vulkan SDK first.")
+endif()
 
-set(VULKAN_INCLUDE_DIR ${VULKAN_ROOT}/include)
-set(VULKAN_LIBRARY ${VULKAN_ROOT}/lib/vulkan-1.lib)
-set(GLSLC_EXE ${VULKAN_ROOT}/bin/glslc.exe)
+set(VULKAN_ROOT $ENV{VULKAN_SDK})
+set(VULKAN_INCLUDE_DIR ${VULKAN_ROOT}/Include)
+set(VULKAN_LIBRARY ${VULKAN_ROOT}/Lib/vulkan-1.lib)
+set(GLSLC_EXE ${VULKAN_ROOT}/Bin/glslc.exe)
 
-message(STATUS "Using Vulkan Include: ${VULKAN_INCLUDE_DIR}")
-message(STATUS "Using Vulkan Library: ${VULKAN_LIBRARY}")
-message(STATUS "Using glslc compiler : ${GLSLC_EXE}")
+message(STATUS "Using Vulkan SDK root   : ${VULKAN_ROOT}")
+message(STATUS "Using Vulkan Include    : ${VULKAN_INCLUDE_DIR}")
+message(STATUS "Using Vulkan Library    : ${VULKAN_LIBRARY}")
+message(STATUS "Using glslc compiler    : ${GLSLC_EXE}")
 
 include_directories(
     SYSTEM ${CMAKE_SOURCE_DIR}/thirdParty/include
@@ -23,7 +30,6 @@ include_directories(
 
 link_directories(
     ${CMAKE_SOURCE_DIR}/thirdParty/lib
-    ${VULKAN_ROOT}/lib
 )
 
 file(COPY ${CMAKE_SOURCE_DIR}/assets DESTINATION ${CMAKE_BINARY_DIR})

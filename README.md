@@ -55,6 +55,35 @@ It is **not** currently packaged as a production-ready renderer.
 
 ---
 
+### Repository Contents and Minimal Assets
+
+This repository includes:
+
+- the source code,
+- one default glTF mesh asset,
+- one default HDR environment map,
+- and the default runtime configuration used by the sample setup.
+
+The default Gaussian scene file
+
+```text
+assets/pointclouds/bicycle.ply
+```
+
+is **not stored directly in the Git repository**, because it is too large for convenient repository distribution.
+
+Instead, it is provided separately through the **GitHub Releases** page.
+
+After downloading the file, place it at:
+
+```text
+assets/pointclouds/bicycle.ply
+```
+
+so that the default configuration in `main` can run without further path changes.
+
+---
+
 ### Requirements
 
 - **Windows**
@@ -63,6 +92,10 @@ It is **not** currently packaged as a production-ready renderer.
 - A Vulkan-capable GPU and driver
 
 Please make sure the Vulkan SDK is installed correctly and that Visual Studio can locate the required headers and libraries.
+
+> **Note**  
+> This repository does **not** bundle the Vulkan SDK.  
+> Please install the Vulkan SDK separately before building the project, and make sure the `VULKAN_SDK` environment variable is configured correctly.
 
 ---
 
@@ -73,6 +106,12 @@ This project is intended to be built with **Visual Studio 2022**.
 #### Build
 
 Open the solution in Visual Studio 2022 and build the project.
+
+Before opening the solution in Visual Studio 2022, please make sure that:
+
+- the Vulkan SDK has been installed,
+- the `VULKAN_SDK` environment variable is available,
+- and the required Vulkan tools such as `glslc` can be found under the installed SDK.
 
 #### Run
 
@@ -275,6 +314,35 @@ This repository is released for research and educational purposes and is provide
 
 ---
 
+### 仓库内容与最小资源说明
+
+本仓库包含：
+
+- 源代码，
+- 一个默认的 glTF 网格资源，
+- 一个默认的 HDR 环境贴图，
+- 以及与示例配置对应的默认运行路径设置。
+
+默认 3DGS 点云文件：
+
+```text
+assets/pointclouds/bicycle.ply
+```
+
+**没有直接放在 Git 仓库中**，因为该文件体积较大，不适合直接随仓库分发。
+
+该文件通过 **GitHub Releases** 页面单独提供。
+
+下载后，请将其放到：
+
+```text
+assets/pointclouds/bicycle.ply
+```
+
+这样就可以直接使用 `main` 中的默认路径配置运行，无需额外修改代码。
+
+---
+
 ### 环境要求
 
 - **Windows**
@@ -284,11 +352,21 @@ This repository is released for research and educational purposes and is provide
 
 请确保 Vulkan SDK 已正确安装，并且 Visual Studio 可以找到相应的头文件与库文件。
 
+> **说明**  
+> 本仓库**不附带** Vulkan SDK。  
+> 在编译项目前，请先自行安装 Vulkan SDK，并确保 `VULKAN_SDK` 环境变量已正确配置。
+
 ---
 
 ### 编译与运行
 
 本项目推荐使用 **Visual Studio 2022** 进行编译。
+
+在使用 Visual Studio 2022 打开解决方案之前，请先确认：
+
+- 已正确安装 Vulkan SDK；
+- `VULKAN_SDK` 环境变量可用；
+- 已安装的 Vulkan SDK 中包含 `glslc` 等所需工具。
 
 #### 编译
 
