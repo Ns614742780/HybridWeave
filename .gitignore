@@ -12,6 +12,7 @@ out/
 x64/
 bin/
 lib/
+thirdParty/vulkan/
 
 # CMake generated files
 CMakeCache.txt
